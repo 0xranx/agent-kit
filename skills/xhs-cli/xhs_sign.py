@@ -173,6 +173,69 @@ def browser_navigate_and_capture(url: str, api_pattern: str,
     return captured[0] if captured else None
 
 
+def navigate_search_page(keyword: str, timeout: int = 20) -> dict:
+    """
+    导航到搜索页，从 Vue 运行时状态提取搜索结果。
+    小红书搜索已改为 SSR + Vue hydration，不再发客户端 API 请求。
+
+    Returns:
+        {"items": [...], "has_more": bool} 或 {"code": -1, "msg": "..."}
+    """
+    from urllib.parse import quote as _quote
+
+    _ensure_browser()
+    url = f"https://www.xiaohongshu.com/search_result?keyword={_quote(keyword)}"
+
+    try:
+        _page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+        time.sleep(3)
+    except Exception:
+        pass
+
+    try:
+        feeds = _page.evaluate('''() => {
+            const s = window.__INITIAL_STATE__;
+            if (!s || !s.search) return null;
+            const raw = s.search.feeds._rawValue || s.search.feeds._value || s.search.feeds;
+            if (!Array.isArray(raw)) return null;
+            const hasMore = s.search.hasMore;
+            const hasMoreVal = hasMore && (hasMore._rawValue !== undefined ? hasMore._rawValue : hasMore);
+            return {
+                items: raw.map(item => {
+                    const nc = item.noteCard || {};
+                    return {
+                        id: item.id || nc.noteId || '',
+                        model_type: item.modelType || '',
+                        note_card: {
+                            note_id: nc.noteId || item.id || '',
+                            xsec_token: item.xsecToken || nc.xsecToken || '',
+                            display_title: nc.displayTitle || '',
+                            type: nc.type || 'normal',
+                            interact_info: {
+                                liked_count: (nc.interactInfo || {}).likedCount || '0',
+                                collected_count: (nc.interactInfo || {}).collectedCount || '0',
+                                comment_count: (nc.interactInfo || {}).commentCount || '0',
+                                share_count: (nc.interactInfo || {}).shareCount || '0',
+                            },
+                            user: {
+                                nickname: (nc.user || {}).nickname || '',
+                                user_id: (nc.user || {}).userId || '',
+                                avatar: (nc.user || {}).avatar || '',
+                            },
+                        },
+                    };
+                }),
+                has_more: !!hasMoreVal,
+            };
+        }''')
+
+        if feeds and feeds.get("items"):
+            return {"code": 0, "success": True, "data": feeds}
+        return {"code": -1, "msg": "搜索结果为空", "data": {"items": []}}
+    except Exception as e:
+        return {"code": -1, "msg": f"提取搜索结果失败: {e}", "data": {"items": []}}
+
+
 def navigate_note_page(note_id: str, xsec_token: str = "",
                        timeout: int = 20) -> dict:
     """

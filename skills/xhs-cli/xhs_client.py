@@ -9,6 +9,7 @@ from urllib.parse import quote
 from xhs_sign import (
     browser_navigate_and_capture,
     navigate_note_page,
+    navigate_search_page,
     navigate_user_posted,
     sign,
 )
@@ -21,14 +22,8 @@ _note_cache: dict[str, dict] = {}
 
 def search_notes(keyword: str, page: int = 1, page_size: int = 20,
                  sort: str = "general", note_type: int = 0) -> dict:
-    """搜索笔记：导航到搜索页并拦截 API 响应"""
-    encoded = quote(keyword)
-    url = (f"https://www.xiaohongshu.com/search_result"
-           f"?keyword={encoded}&source=web_search_result_notes")
-    result = browser_navigate_and_capture(url, "/api/sns/web/v1/search/notes")
-    if result is None:
-        return {"code": -1, "msg": "未捕获到搜索响应", "data": {}}
-    return result
+    """搜索笔记：导航到搜索页，从 Vue 运行时状态提取结果"""
+    return navigate_search_page(keyword)
 
 
 def _load_note_page(note_id: str, xsec_token: str = "") -> dict:

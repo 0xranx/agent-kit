@@ -74,8 +74,8 @@ def fmt_search(data: dict) -> str:
         title = nc.get("display_title", "(无标题)")
         user = nc.get("user", {}).get("nickname", "未知")
         likes = nc.get("interact_info", {}).get("liked_count", "0")
-        nid = item.get("id", "")
-        token = item.get("xsec_token", "")
+        nid = item.get("id", "") or nc.get("note_id", "")
+        token = item.get("xsec_token", "") or nc.get("xsec_token", "")
         ntype = "视频" if nc.get("type") == "video" else "图文"
         lines.append(f"  {i}. [{ntype}] {title}")
         lines.append(f"     作者: {user} | 赞: {likes}")
