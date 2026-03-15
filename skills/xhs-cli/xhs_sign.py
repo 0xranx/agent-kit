@@ -40,34 +40,59 @@ def _parse_cookie_string(cookie_str: str) -> list[dict]:
     return cookies
 
 
+def _has_valid_cookie() -> bool:
+    """检查是否存在已保存的 Cookie 文件"""
+    if not COOKIE_FILE.exists():
+        return False
+    cookie_str = COOKIE_FILE.read_text().strip()
+    return bool(cookie_str) and "web_session" in cookie_str
+
+
 def _ensure_browser():
-    """懒加载：首次调用时启动 Playwright 浏览器并导航到小红书"""
+    """懒加载：有 Cookie 用 headless，没有则提示登录"""
     global _playwright, _browser, _context, _page, _a1
 
     if _page is not None:
         return
 
+    if not _has_valid_cookie():
+        raise RuntimeError(
+            "未登录小红书。请先执行以下任一方式登录:\n"
+            "  1. 扫码登录: python xhs_sign.py login\n"
+            "  2. 手动粘贴: python xhs_sign.py set-cookie \"你的cookie字符串\""
+        )
+
     from playwright.sync_api import sync_playwright
     from playwright_stealth import Stealth
 
     _playwright = sync_playwright().start()
-    _browser = _playwright.chromium.launch(headless=False)
+    # 有 Cookie → headless 模式，不弹窗
+    _browser = _playwright.chromium.launch(headless=True)
     _context = _browser.new_context(
         user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
-        )
+        ),
+        # 反检测：设置 viewport 和 locale 模拟真实浏览器
+        viewport={"width": 1440, "height": 900},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
     )
 
-    if COOKIE_FILE.exists():
-        cookie_str = COOKIE_FILE.read_text().strip()
-        if cookie_str:
-            _context.add_cookies(_parse_cookie_string(cookie_str))
+    cookie_str = COOKIE_FILE.read_text().strip()
+    _context.add_cookies(_parse_cookie_string(cookie_str))
 
     _page = _context.new_page()
     stealth = Stealth()
     stealth.apply_stealth_sync(_page)
+
+    # 反检测：覆盖 webdriver 标记
+    _page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+    """)
 
     _page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded")
     time.sleep(3)
@@ -498,12 +523,45 @@ def login_interactive(timeout: int = 120):
     _playwright = None
 
 
+def save_cookie_string(cookie_str: str) -> None:
+    """手动保存 Cookie 字符串（从浏览器开发者工具复制）。"""
+    cookie_str = cookie_str.strip()
+    if not cookie_str:
+        _p("Cookie 不能为空")
+        return
+    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    COOKIE_FILE.write_text(cookie_str)
+    _p(f"Cookie 已保存到 {COOKIE_FILE}")
+    # 验证
+    cookies = _parse_cookie_string(cookie_str)
+    names = {c["name"] for c in cookies}
+    has_session = "web_session" in names
+    has_a1 = "a1" in names
+    if has_session and has_a1:
+        _p(f"Cookie 有效（包含 a1 + web_session，共 {len(cookies)} 项）")
+    else:
+        missing = []
+        if not has_a1:
+            missing.append("a1")
+        if not has_session:
+            missing.append("web_session")
+        _p(f"警告: Cookie 缺少 {', '.join(missing)}，可能无法正常使用")
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "login":
         login_interactive()
+    elif len(sys.argv) > 2 and sys.argv[1] == "set-cookie":
+        save_cookie_string(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] == "status":
+        if _has_valid_cookie():
+            cookies = _parse_cookie_string(COOKIE_FILE.read_text().strip())
+            print(f"已登录（{len(cookies)} 个 cookie）")
+        else:
+            print("未登录")
     else:
-        print("正在启动签名服务...")
-        headers = sign("/api/sns/web/v1/search/notes", {"keyword": "AI编程"})
-        print(f"签名结果: {headers}")
-        print(f"a1 cookie: {get_a1()}")
+        print("用法:")
+        print("  python xhs_sign.py login              # 扫码登录")
+        print("  python xhs_sign.py set-cookie \"...\"    # 手动粘贴 Cookie")
+        print("  python xhs_sign.py status             # 检查登录状态")
