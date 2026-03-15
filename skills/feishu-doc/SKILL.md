@@ -1,0 +1,121 @@
+---
+name: feishu-doc
+description: 飞书文档助手。读写飞书云文档和知识库，支持创建、导出、精确编辑、同步到知识库、群消息通知。当用户提到飞书文档、知识库、wiki，或发送 feishu.cn 链接时使用此 Skill。
+---
+
+# 飞书文档助手
+
+通过 `feishu_doc.py` 统一管理飞书文档的读取、写入、编辑和知识库操作。
+
+## 前置条件
+
+1. 安装依赖：`pip install feishu-docx markdown2feishu httpx`
+2. 配置凭证（二选一）：
+   - 设置环境变量 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`
+   - 或编辑 `skills/feishu-doc/config.yaml`
+3. 飞书应用需开通权限：`docx:document`（文档读写）、`wiki:wiki`（知识库）、`im:message`（群消息）
+
+验证连通性：
+```bash
+python skills/feishu-doc/feishu_doc.py test
+```
+
+## 触发条件
+
+以下情况使用此 Skill：
+- 用户发送了飞书链接（feishu.cn/docx/、feishu.cn/wiki/、feishu.cn/sheets/）
+- 用户说「写到飞书」「同步到知识库」「看一下飞书文档」「发到群里」
+- 用户要求导出、编辑、对比飞书文档内容
+
+## 读取文档
+
+当用户想查看飞书文档内容时：
+```bash
+python skills/feishu-doc/feishu_doc.py read <URL>                  # 读取文档，输出 Markdown
+python skills/feishu-doc/feishu_doc.py read <URL> --with-block-ids  # 带 block_id（编辑前必用）
+```
+
+支持所有飞书文档 URL 格式：`/docx/`、`/wiki/`、`/sheets/`、`/base/`。
+
+当用户想了解知识库结构时：
+```bash
+python skills/feishu-doc/feishu_doc.py wiki-tree <space_id 或 wiki_URL>  # 树形结构
+python skills/feishu-doc/feishu_doc.py export-wiki <space_id 或 wiki_URL> -o ./output  # 批量导出
+```
+
+## 创建文档
+
+当用户说「写一篇飞书文档」「把这个同步到飞书」时：
+```bash
+python skills/feishu-doc/feishu_doc.py create "标题" -c "Markdown 内容"   # 从内容创建
+python skills/feishu-doc/feishu_doc.py create "标题" -f ./report.md       # 从文件创建
+python skills/feishu-doc/feishu_doc.py create "标题" -f ./report.md --wiki <parent_node_token>  # 创建到知识库
+```
+
+创建到知识库时，如果权限不足会自动降级为云文档，并提示手动移入。
+
+## 编辑已有文档
+
+当用户说「改一下这个文档」「把第X段更新成…」时：
+
+**第一步 — 读出文档结构（找到要改的块）：**
+```bash
+python skills/feishu-doc/feishu_doc.py list-blocks <URL>
+```
+输出每个块的 block_id、类型和内容摘要。
+
+**第二步 — 精确操作：**
+```bash
+python skills/feishu-doc/feishu_doc.py update-block <URL> <block_id> "新内容"   # 改一个块
+python skills/feishu-doc/feishu_doc.py delete-block <URL> <block_id>            # 删一个块
+python skills/feishu-doc/feishu_doc.py append <URL> -c "追加内容"                # 末尾追加
+python skills/feishu-doc/feishu_doc.py overwrite <URL> -f ./new.md              # 清空重写
+```
+
+## 知识库管理
+
+```bash
+python skills/feishu-doc/feishu_doc.py wiki-tree <URL>                     # 查看知识库结构
+python skills/feishu-doc/feishu_doc.py wiki-move <文档URL> <目标节点token>   # 云文档移入知识库（需 OAuth）
+python skills/feishu-doc/feishu_doc.py wiki-sync <md文件> --parent <节点>   # 同步到知识库（幂等）
+```
+
+## 群消息
+
+当用户说「通知群里」「发到飞书群」时：
+```bash
+python skills/feishu-doc/feishu_doc.py notify "标题" "Markdown内容"   # 发卡片消息
+python skills/feishu-doc/feishu_doc.py send "纯文本消息"               # 发文本
+python skills/feishu-doc/feishu_doc.py read-chat [N]                  # 读最近 N 条群消息
+```
+
+## 典型工作流
+
+### 「帮我看看知识库里有什么」
+1. `wiki-tree` 列出结构
+2. 用 `read` 读取感兴趣的文档
+3. 总结返回
+
+### 「把这份报告写到知识库运营相关下面」
+1. 整理内容为 Markdown，写入临时文件
+2. `create --wiki <parent_node>` 创建
+3. 如果权限不足，自动降级 `create`（云文档）→ 提示用 `wiki-move` 迁入
+4. `notify` 通知群聊
+
+### 「这个文档第二段数据错了，改成 XXX」
+1. `list-blocks <URL>` 列出所有块和 block_id
+2. 找到目标块
+3. `update-block <URL> <block_id> "新内容"` 精确更新
+
+### 「把这篇微信文章转成飞书文档」
+1. `import-wechat <微信URL>` 抓取转换
+2. 返回飞书文档链接
+
+## 注意事项
+
+- 知识库写入需要 Bot 被添加为空间「可编辑」成员；公开知识库需人工添加
+- `wiki-move` 需要 OAuth 登录：先执行 `python skills/feishu-doc/feishu_doc.py login`
+- 飞书 API 有限流，工具内置 429 自动重试（指数退避）
+- `wiki-sync` 有幂等保护，同名文档不会重复创建
+- 表格超过 9 行会自动拆分成多个连续表格（飞书 API 限制）
+- 卡片消息的内容支持飞书 Markdown（`**粗体**`、`[链接](url)`、`\n` 换行）

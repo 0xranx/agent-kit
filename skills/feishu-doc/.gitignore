@@ -1,0 +1,6 @@
+# 运行时生成的敏感文件
+user_token.json
+sync_registry.json
+
+# 不要提交带凭证的配置（用户应自行填写或用环境变量）
+# config.yaml 本身提交为空模板，用户本地修改后不应再提交

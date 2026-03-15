@@ -1,0 +1,11 @@
+# 运行时敏感文件
+**/user_token.json
+**/sync_registry.json
+**/.claude/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
