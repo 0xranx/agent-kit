@@ -1,2 +1,3 @@
-playwright>=1.40.0
-playwright-stealth>=1.0.0
+# Python 无额外依赖，浏览器操作通过 agent-browser CLI
+# 安装 agent-browser:
+#   npm install -g agent-browser && agent-browser install

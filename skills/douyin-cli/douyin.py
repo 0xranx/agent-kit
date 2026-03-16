@@ -30,7 +30,7 @@ from douyin_sign import (
     save_cookie_string,
     _has_valid_cookie,
     COOKIE_FILE,
-    _parse_cookie_string,
+    BROWSER_DATA_DIR,
 )
 
 
@@ -46,10 +46,19 @@ def _ts_to_str(ts) -> str:
 def _count_str(n) -> str:
     if n is None:
         return "0"
-    n = int(n)
-    if n >= 10000:
-        return f"{n / 10000:.1f}w"
-    return str(n)
+    s = str(n).strip()
+    if not s:
+        return "0"
+    # 已经是 "4.0万" 这样的格式，直接返回
+    if "万" in s or "w" in s.lower():
+        return s
+    try:
+        num = int(float(s))
+        if num >= 10000:
+            return f"{num / 10000:.1f}w"
+        return str(num)
+    except (ValueError, TypeError):
+        return s
 
 
 # ── 格式化 ───────────────────────────────────────
@@ -274,11 +283,10 @@ def main():
         save_cookie_string(args[1])
 
     elif cmd == "status":
-        if _has_valid_cookie():
-            cookies = _parse_cookie_string(COOKIE_FILE.read_text().strip())
-            names = {c["name"] for c in cookies}
-            logged_in = "sessionid" in names or "sessionid_ss" in names
-            print(f"{'已登录' if logged_in else '有 Cookie 但未登录'}（{len(cookies)} 个 cookie）")
+        if BROWSER_DATA_DIR.exists() and any(BROWSER_DATA_DIR.iterdir()):
+            print("已有浏览器 profile（登录态已保存）")
+        elif _has_valid_cookie():
+            print("有 Cookie 文件")
         else:
             print("未登录")
 

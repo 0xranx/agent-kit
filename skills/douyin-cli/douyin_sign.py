@@ -1,528 +1,347 @@
 """
-抖音 Web 签名与浏览器管理模块
-通过 Playwright 浏览器维护登录态，拦截 API 响应获取数据。
+抖音 Web 浏览器管理模块（基于 agent-browser）
+
+核心策略：
+- 使用 --user-data-dir 持久化浏览器数据（cookie/session/localStorage 自动保留）
+- 用 headed 模式（抖音对 headless 检测严格）
+- 验证码/登录弹窗由用户在浏览器中手动处理
+- 每次操作等待目标内容出现，不主动检测验证码
+
+依赖: npm install -g agent-browser && agent-browser install
 """
 
-import atexit
 import json
+import subprocess
 import time
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-_playwright = None
-_browser = None
-_context = None
-_page = None
-
 SKILL_DIR = Path(__file__).parent
-COOKIE_FILE = SKILL_DIR / "data" / "douyin_cookie.txt"
+DATA_DIR = SKILL_DIR / "data"
+BROWSER_DATA_DIR = DATA_DIR / "browser_profile"  # 持久化浏览器数据
+COOKIE_FILE = DATA_DIR / "douyin_cookie.txt"      # 备用 cookie 文件
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+_browser_open = False
 
 
 def _p(msg: str):
     print(msg, flush=True)
 
 
-def _parse_cookie_string(cookie_str: str) -> list[dict]:
-    cookies = []
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, value = part.split("=", 1)
-            cookies.append({
-                "name": name.strip(),
-                "value": value.strip(),
-                "domain": ".douyin.com",
-                "path": "/",
-            })
-    return cookies
+def _run(cmd: str, timeout: int = 15) -> str:
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return ""
+    except Exception as e:
+        return f"error: {e}"
 
 
-def _has_valid_cookie() -> bool:
-    if not COOKIE_FILE.exists():
-        return False
-    cookie_str = COOKIE_FILE.read_text().strip()
-    return bool(cookie_str) and "ttwid" in cookie_str
-
+# ── 浏览器管理 ───────────────────────────────────
 
 def _ensure_browser():
-    """懒加载：有 Cookie 用 headless，没有则提示登录"""
-    global _playwright, _browser, _context, _page
-
-    if _page is not None:
+    """确保浏览器已打开。使用持久化 profile 复用登录态。"""
+    global _browser_open
+    if _browser_open:
         return
 
-    if not _has_valid_cookie():
-        raise RuntimeError(
-            "未登录抖音。请先执行以下任一方式登录:\n"
-            "  1. 扫码登录: python douyin_sign.py login\n"
-            "  2. 手动粘贴: python douyin_sign.py set-cookie \"你的cookie字符串\""
-        )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BROWSER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    from playwright.sync_api import sync_playwright
-    from playwright_stealth import Stealth
-
-    _playwright = sync_playwright().start()
-    # 抖音反爬较强，用非 headless 模式以便用户手动过验证码
-    _browser = _playwright.chromium.launch(headless=False)
-    _context = _browser.new_context(
-        user_agent=UA,
-        viewport={"width": 1440, "height": 900},
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
+    # 用 --user-data-dir 持久化所有浏览器数据（cookie/session/localStorage）
+    _run(
+        f'agent-browser open "https://www.douyin.com" '
+        f'--headed --session-name douyin_session',
+        timeout=30
     )
+    time.sleep(3)
+    _browser_open = True
 
-    cookie_str = COOKIE_FILE.read_text().strip()
-    _context.add_cookies(_parse_cookie_string(cookie_str))
 
-    _page = _context.new_page()
-    Stealth().apply_stealth_sync(_page)
+def _close_browser():
+    global _browser_open
+    _run("agent-browser close")
+    _browser_open = False
 
-    _page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
-    """)
 
-    for attempt in range(3):
-        try:
-            _page.goto("https://www.douyin.com", wait_until="domcontentloaded", timeout=15000)
-            break
-        except Exception:
-            if attempt < 2:
-                time.sleep(2)
+def _wait_for_content(selector: str, label: str = "内容", max_wait: int = 180) -> bool:
+    """等待页面上出现指定元素（用户可在浏览器中处理验证码/登录）。"""
+    _p(f"等待{label}加载（如有验证码或登录弹窗，请在浏览器中完成）...")
+    for i in range(max_wait // 2):
+        time.sleep(2)
+        count = _run(f'agent-browser get count "{selector}"', timeout=5)
+        if count and count.isdigit() and int(count) > 0:
+            _p(f"  {label}已加载")
+            return True
+        if i % 10 == 9:
+            _p(f"  等待中... ({(i+1)*2}秒)")
+    _p(f"  {label}加载超时")
+    return False
+
+
+def _navigate(url: str, timeout: int = 30):
+    """导航到 URL。"""
+    _ensure_browser()
+    _run(f'agent-browser goto "{url}"', timeout=timeout)
     time.sleep(3)
 
-    atexit.register(_shutdown)
 
-
-def _shutdown():
-    global _playwright, _browser, _context, _page
+def _eval_js(script: str, timeout: int = 15):
+    """在页面中执行 JavaScript 并返回结果。"""
+    tmp = DATA_DIR / "_eval_tmp.js"
+    tmp.write_text(script, encoding="utf-8")
+    raw = _run(f'agent-browser eval "$(cat \'{tmp}\')"', timeout=timeout)
+    tmp.unlink(missing_ok=True)
+    if not raw:
+        return None
     try:
-        if _browser:
-            _browser.close()
-        if _playwright:
-            _playwright.stop()
-    except Exception:
-        pass
-    _browser = _page = _context = _playwright = None
-
-
-# ── API 拦截 ─────────────────────────────────────
-
-def _check_and_wait_captcha(max_wait: int = 180) -> None:
-    """检测验证码/安全验证，等待用户手动完成（含图形验证+短信验证，最长 3 分钟）。"""
-    try:
-        # 检测标志：#captcha_container、验证码 iframe、或手机号输入框
-        captcha = _page.locator('#captcha_container')
-        verify_iframe = _page.locator('iframe[src*="verifycenter"], iframe[src*="captcha"]')
-        phone_input = _page.locator('input[placeholder*="手机"], input[type="tel"]')
-
-        has_verify = False
-        if captcha.count() > 0 and captcha.first.is_visible():
-            has_verify = True
-        elif verify_iframe.count() > 0 and verify_iframe.first.is_visible():
-            has_verify = True
-        elif phone_input.count() > 0 and phone_input.first.is_visible():
-            has_verify = True
-
-        if not has_verify:
-            return
-
-        _p("检测到安全验证（可能含图形验证+短信验证），请在浏览器中完成...")
-        _p("完成后页面会自动跳转，脚本会自动检测。")
-
-        for i in range(max_wait // 2):
-            time.sleep(2)
-            try:
-                # 所有验证元素都消失 = 通过
-                cap_vis = captcha.count() > 0 and captcha.first.is_visible()
-                iframe_vis = verify_iframe.count() > 0 and verify_iframe.first.is_visible()
-                phone_vis = phone_input.count() > 0 and phone_input.first.is_visible()
-                if not cap_vis and not iframe_vis and not phone_vis:
-                    _p("安全验证已通过")
-                    time.sleep(3)
-                    return
-            except Exception:
-                _p("安全验证已通过")
-                time.sleep(3)
-                return
-            if i % 10 == 9:
-                _p(f"  等待验证... ({(i+1)*2}秒)")
-        _p("验证等待超时（3 分钟）")
-    except Exception:
-        pass
-
-
-def capture_api_response(url: str, api_pattern: str, timeout: int = 20) -> dict | None:
-    """导航到 URL，拦截匹配 api_pattern 的 API 响应并返回 JSON。"""
-    _ensure_browser()
-
-    captured = []
-
-    def _on_response(response):
-        if api_pattern in response.url and response.status == 200:
-            try:
-                captured.append(response.json())
-            except Exception:
-                pass
-
-    _page.on("response", _on_response)
-    try:
-        _page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        # 等待：要么捕获到 API 响应，要么等待用户过验证码（最多 3 分钟）
-        for i in range(90):
-            time.sleep(2)
-            if captured:
-                break
-            if i % 10 == 9:
-                _p(f"  等待页面加载... ({(i+1)*2}秒)")
-                # 如果有验证码提示一下
-                cap = _page.locator('#captcha_container')
-                iframe = _page.locator('iframe[src*="verifycenter"]')
-                try:
-                    if (cap.count() > 0 and cap.first.is_visible()) or \
-                       (iframe.count() > 0 and iframe.first.is_visible()):
-                        _p("  请在浏览器中完成验证码...")
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    finally:
-        _page.remove_listener("response", _on_response)
-
-    return captured[0] if captured else None
-
-
-def capture_multiple_api_responses(url: str, api_pattern: str,
-                                    timeout: int = 20) -> list[dict]:
-    """导航到 URL，拦截所有匹配 api_pattern 的 API 响应。"""
-    _ensure_browser()
-
-    captured = []
-
-    def _on_response(response):
-        if api_pattern in response.url and response.status == 200:
-            try:
-                captured.append(response.json())
-            except Exception:
-                pass
-
-    _page.on("response", _on_response)
-    try:
-        _page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
-        time.sleep(3)
-    except Exception:
-        pass
-    finally:
-        _page.remove_listener("response", _on_response)
-
-    return captured
-
-
-# ── RENDER_DATA 提取 ─────────────────────────────
-
-def extract_render_data(url: str, timeout: int = 20) -> dict | None:
-    """导航到页面，提取 <script id="RENDER_DATA"> 中的 JSON 数据。"""
-    _ensure_browser()
-
-    try:
-        _page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
-        time.sleep(2)
-    except Exception:
-        pass
-
-    try:
-        raw = _page.evaluate('''() => {
-            const el = document.getElementById('RENDER_DATA');
-            return el ? el.textContent : null;
-        }''')
-        if raw:
-            decoded = unquote(raw)
-            return json.loads(decoded)
-    except Exception:
-        pass
-
-    return None
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
 
 
 # ── 搜索 ────────────────────────────────────────
 
-def search_videos(keyword: str, timeout: int = 25) -> dict:
-    """搜索抖音视频。优先 API 拦截，fallback 到 RENDER_DATA。"""
-    _ensure_browser()
-    url = f"https://www.douyin.com/search/{quote(keyword)}?type=video"
+def search_videos(keyword: str) -> dict:
+    """搜索抖音视频。"""
+    _navigate(f"https://www.douyin.com/search/{quote(keyword)}?type=video")
 
-    captured = []
+    # 等待视频链接出现
+    if not _wait_for_content('a[href*="/video/"]', "搜索结果"):
+        return {"aweme_list": [], "msg": "未获取到搜索结果"}
 
-    def _on_response(response):
-        u = response.url
-        if response.status == 200 and ("aweme" in u) and \
-                ("/web/search/item/" in u or "/general/search/single/" in u):
-            try:
-                data = response.json()
-                if data.get("aweme_list") or data.get("data"):
-                    captured.append(data)
-            except Exception:
-                pass
+    time.sleep(2)
 
-    _page.on("response", _on_response)
-    try:
-        _page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        # 等足够久让搜索 API 完成（含验证码时间）
-        for i in range(90):
-            time.sleep(2)
-            if captured:
-                _p(f"  API 响应已捕获")
-                break
-            if i % 10 == 9:
-                _p(f"  等待数据加载... ({(i+1)*2}秒)")
-                try:
-                    cap = _page.locator('#captcha_container, iframe[src*="verifycenter"]')
-                    if cap.count() > 0 and cap.first.is_visible():
-                        _p("  请在浏览器中完成验证码...")
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    finally:
-        _page.remove_listener("response", _on_response)
+    # 从 DOM 提取
+    result = _eval_js('''
+        (() => {
+            const links = document.querySelectorAll('a[href*="/video/"]');
+            const results = [];
+            const seen = new Set();
+            links.forEach(a => {
+                const href = a.getAttribute("href") || "";
+                const match = href.match(/\\/video\\/(\\d+)/);
+                if (!match || seen.has(match[1])) return;
+                seen.add(match[1]);
+                const text = (a.textContent || "").trim();
+                const parts = text.match(/^([\\d:]+)?\\s*([\\.\\d万]+)?\\s*(.+?)\\s*@(.+?)\\s*(\\d+.*前|\\d+小时前)?$/s);
+                results.push({
+                    aweme_id: match[1],
+                    desc: parts ? parts[3].trim() : text.slice(0, 100),
+                    author: {nickname: parts ? parts[4].trim() : ""},
+                    statistics: {digg_count: parts ? parts[2] : "0"},
+                });
+            });
+            return JSON.stringify({aweme_list: results, has_more: 1});
+        })()
+    ''')
 
-    if captured:
-        return captured[0]
-
-    # Fallback: 从 RENDER_DATA 提取
-    try:
-        raw = _page.evaluate('''() => {
-            const el = document.getElementById('RENDER_DATA');
-            return el ? el.textContent : null;
-        }''')
-        if raw:
-            data = json.loads(unquote(raw))
-            for key, val in data.items():
-                if isinstance(val, dict):
-                    aweme_list = val.get("aweme_list") or val.get("data")
-                    if aweme_list and isinstance(aweme_list, list) and len(aweme_list) > 0:
-                        return {"aweme_list": aweme_list, "status_code": 0}
-    except Exception:
-        pass
-
-    return {"status_code": -1, "aweme_list": [], "msg": "未捕获到搜索响应"}
-
-
-def search_users(keyword: str, timeout: int = 20) -> dict:
-    """搜索抖音用户。"""
-    url = f"https://www.douyin.com/search/{quote(keyword)}?type=user"
-    result = capture_api_response(url, "/aweme/v1/web/discover/search/", timeout)
-    if result is None:
-        result = capture_api_response(url, "/aweme/v1/web/general/search/single/", timeout)
-    if result:
+    if isinstance(result, dict) and result.get("aweme_list"):
         return result
-    return {"status_code": -1, "data": [], "msg": "未捕获到搜索响应"}
+    return {"aweme_list": [], "msg": "未获取到搜索结果"}
+
+
+def search_users(keyword: str) -> dict:
+    """搜索抖音用户。"""
+    _navigate(f"https://www.douyin.com/search/{quote(keyword)}?type=user")
+
+    if not _wait_for_content('a[href*="/user/"]', "用户列表"):
+        return {"data": [], "msg": "未获取到用户"}
+
+    time.sleep(2)
+    result = _eval_js('''
+        (() => {
+            const el = document.getElementById("RENDER_DATA");
+            if (!el) return JSON.stringify({data: []});
+            const data = JSON.parse(decodeURIComponent(el.textContent));
+            for (const [k, v] of Object.entries(data)) {
+                if (v && v.user_list) return JSON.stringify({data: v.user_list});
+            }
+            return JSON.stringify({data: []});
+        })()
+    ''')
+
+    if isinstance(result, dict) and result.get("data"):
+        return result
+    return {"data": [], "msg": "未获取到用户"}
 
 
 # ── 视频详情 ─────────────────────────────────────
 
-def get_video_detail(aweme_id: str, timeout: int = 25) -> dict:
-    """获取视频详情，API 拦截 + RENDER_DATA fallback。"""
-    _ensure_browser()
-    url = f"https://www.douyin.com/video/{aweme_id}"
+def get_video_detail(aweme_id: str) -> dict:
+    """获取视频详情。"""
+    _navigate(f"https://www.douyin.com/video/{aweme_id}")
 
-    captured = []
+    if not _wait_for_content('#RENDER_DATA', "视频详情"):
+        return {"aweme_detail": None, "msg": "获取视频详情失败"}
 
-    def _on_response(response):
-        if "/web/aweme/detail/" in response.url and response.status == 200:
-            try:
-                data = response.json()
-                if data.get("aweme_detail"):
-                    captured.append(data)
-            except Exception:
-                pass
+    time.sleep(2)
+    result = _eval_js('''
+        (() => {
+            const el = document.getElementById("RENDER_DATA");
+            if (!el) return JSON.stringify({error: "no RENDER_DATA"});
+            const data = JSON.parse(decodeURIComponent(el.textContent));
+            for (const [k, v] of Object.entries(data)) {
+                if (v && v.aweme && v.aweme.detail) {
+                    return JSON.stringify({aweme_detail: v.aweme.detail});
+                }
+            }
+            return JSON.stringify({error: "no detail"});
+        })()
+    ''')
 
-    _page.on("response", _on_response)
-    try:
-        _page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        for i in range(60):
-            time.sleep(2)
-            if captured:
-                break
-            if i % 10 == 9:
-                _p(f"  等待加载... ({(i+1)*2}秒)")
-                try:
-                    cap = _page.locator('#captcha_container, iframe[src*="verifycenter"]')
-                    if cap.count() > 0 and cap.first.is_visible():
-                        _p("  请在浏览器中完成验证码...")
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    finally:
-        _page.remove_listener("response", _on_response)
-
-    if captured:
-        return captured[0]
-
-    # Fallback: RENDER_DATA
-    try:
-        raw = _page.evaluate('() => { const el = document.getElementById("RENDER_DATA"); return el ? el.textContent : null; }')
-        if raw:
-            data = json.loads(unquote(raw))
-            for key, val in data.items():
-                if isinstance(val, dict):
-                    detail = val.get("aweme", {}).get("detail")
-                    if detail:
-                        return {"aweme_detail": detail}
-    except Exception:
-        pass
-
+    if isinstance(result, dict) and result.get("aweme_detail"):
+        return result
     return {"aweme_detail": None, "msg": "获取视频详情失败"}
 
 
 # ── 评论 ─────────────────────────────────────────
 
-def get_comments(aweme_id: str, timeout: int = 25) -> dict:
-    """获取视频评论，通过 API 拦截。"""
-    _ensure_browser()
-    url = f"https://www.douyin.com/video/{aweme_id}"
+def get_comments(aweme_id: str) -> dict:
+    """获取视频评论。"""
+    current_url = _run("agent-browser get url", timeout=5)
+    if aweme_id not in (current_url or ""):
+        _navigate(f"https://www.douyin.com/video/{aweme_id}")
+        _wait_for_content('#RENDER_DATA', "视频页面")
+        time.sleep(3)
 
-    captured = []
+    # 滚动触发评论加载
+    _run('agent-browser scroll --direction down --amount 500')
+    time.sleep(3)
 
-    def _on_response(response):
-        u = response.url
-        if "comment/list" in u and "douyin.com" in u and response.status == 200:
-            if "/reply/" not in u:
-                try:
-                    data = response.json()
-                    if data.get("comments"):
-                        captured.append(data)
-                except Exception:
-                    pass
+    result = _eval_js('''
+        (() => {
+            const items = document.querySelectorAll(
+                '[class*="CommentListContainer"] [class*="commentItem"],' +
+                '[class*="comment-item"],' +
+                '[class*="comment-mainContent"]'
+            );
+            if (!items.length) return JSON.stringify({comments: []});
+            const comments = [];
+            items.forEach(item => {
+                const nameEl = item.querySelector('[class*="name"], a[href*="/user/"]');
+                const contentEl = item.querySelector('[class*="content"], p');
+                const likeEl = item.querySelector('[class*="like"], [class*="digg"]');
+                if (contentEl) {
+                    comments.push({
+                        text: contentEl.textContent.trim().slice(0, 200),
+                        user: {nickname: nameEl ? nameEl.textContent.trim() : ''},
+                        digg_count: likeEl ? likeEl.textContent.trim() : '0',
+                    });
+                }
+            });
+            return JSON.stringify({comments, has_more: 1});
+        })()
+    ''')
 
-    _page.on("response", _on_response)
-    try:
-        _page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        # 等待页面加载 + 评论 API 触发
-        for i in range(60):
-            time.sleep(2)
-            if captured:
-                break
-            # 滚动到评论区触发加载
-            if i == 3:
-                _page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            if i == 6:
-                _page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            if i % 10 == 9:
-                _p(f"  等待评论加载... ({(i+1)*2}秒)")
-                try:
-                    cap = _page.locator('#captcha_container, iframe[src*="verifycenter"]')
-                    if cap.count() > 0 and cap.first.is_visible():
-                        _p("  请在浏览器中完成验证码...")
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    finally:
-        _page.remove_listener("response", _on_response)
-
-    if captured:
-        return captured[0]
-    return {"comments": [], "has_more": 0, "cursor": 0, "msg": "未捕获到评论"}
+    if isinstance(result, dict) and result.get("comments"):
+        return result
+    return {"comments": [], "msg": "未获取到评论"}
 
 
 # ── 用户主页 ─────────────────────────────────────
 
-def get_user_profile(sec_user_id: str, timeout: int = 20) -> dict:
-    """获取用户主页信息，通过 API 拦截。"""
-    url = f"https://www.douyin.com/user/{sec_user_id}"
+def get_user_profile(sec_user_id: str) -> dict:
+    """获取用户主页信息。"""
+    _navigate(f"https://www.douyin.com/user/{sec_user_id}")
 
-    results = capture_multiple_api_responses(url, "/aweme/v1/web/user/profile/other/", timeout)
-    if results:
-        return results[0]
+    if not _wait_for_content('#RENDER_DATA', "用户主页"):
+        return {"user": None, "msg": "获取用户信息失败"}
 
-    # fallback: RENDER_DATA
-    render = extract_render_data(url, timeout)
-    if render:
-        for key, val in render.items():
-            if isinstance(val, dict) and "user" in val:
-                return {"user": val["user"]}
+    time.sleep(2)
+    result = _eval_js('''
+        (() => {
+            const el = document.getElementById("RENDER_DATA");
+            if (!el) return JSON.stringify({error: "no"});
+            const data = JSON.parse(decodeURIComponent(el.textContent));
+            for (const [k, v] of Object.entries(data)) {
+                if (v && v.user && v.user.user) return JSON.stringify({user: v.user.user});
+                if (v && v.user && v.user.secUid) return JSON.stringify({user: v.user});
+            }
+            return JSON.stringify({error: "no user"});
+        })()
+    ''')
 
+    if isinstance(result, dict) and result.get("user"):
+        return result
     return {"user": None, "msg": "获取用户信息失败"}
 
 
-def get_user_posts(sec_user_id: str, timeout: int = 20) -> dict:
-    """获取用户发布的视频列表。"""
-    url = f"https://www.douyin.com/user/{sec_user_id}"
-    result = capture_api_response(url, "/aweme/v1/web/aweme/post/", timeout)
-    if result:
+def get_user_posts(sec_user_id: str) -> dict:
+    """获取用户作品列表。"""
+    current_url = _run("agent-browser get url", timeout=5)
+    if sec_user_id not in (current_url or ""):
+        _navigate(f"https://www.douyin.com/user/{sec_user_id}")
+        _wait_for_content('#RENDER_DATA', "用户主页")
+        time.sleep(3)
+
+    result = _eval_js('''
+        (() => {
+            const el = document.getElementById("RENDER_DATA");
+            if (!el) return JSON.stringify({error: "no"});
+            const data = JSON.parse(decodeURIComponent(el.textContent));
+            for (const [k, v] of Object.entries(data)) {
+                if (v && v.post && v.post.data) {
+                    return JSON.stringify({aweme_list: v.post.data, has_more: v.post.hasMore || 0});
+                }
+            }
+            return JSON.stringify({error: "no posts"});
+        })()
+    ''')
+
+    if isinstance(result, dict) and result.get("aweme_list"):
         return result
-    return {"aweme_list": [], "has_more": 0, "msg": "未捕获到用户作品"}
+    return {"aweme_list": [], "msg": "获取用户作品失败"}
 
 
 # ── 登录 ─────────────────────────────────────────
 
-def login_interactive(timeout: int = 120):
-    """打开浏览器让用户扫码登录抖音。"""
-    global _playwright, _browser, _context, _page
+def login_interactive(timeout: int = 300):
+    """打开浏览器让用户完成所有验证和登录。使用持久化 profile 保存状态。"""
+    _run("agent-browser close", timeout=5)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BROWSER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    _shutdown()
+    _p("正在打开抖音...")
+    _run(
+        f'agent-browser open "https://www.douyin.com" '
+        f'--headed --session-name douyin_session',
+        timeout=30
+    )
+    time.sleep(3)
 
-    from playwright.sync_api import sync_playwright
-    from playwright_stealth import Stealth
+    _p(f"请在浏览器中完成所有验证和登录（{timeout // 60} 分钟内）：")
+    _p("  1. 如果有拼图/形状验证码 → 手动完成")
+    _p("  2. 如果要求手机号验证 → 输入并验证")
+    _p("  3. 如果有登录弹窗 → 扫码或手机号登录")
+    _p("  4. 完成后你会看到抖音首页推荐内容")
+    _p("")
+    _p("脚本会自动检测登录状态...")
 
-    _playwright = sync_playwright().start()
-    _browser = _playwright.chromium.launch(headless=False)
-    _context = _browser.new_context(user_agent=UA)
-    _page = _context.new_page()
-    Stealth().apply_stealth_sync(_page)
-
-    _page.goto("https://www.douyin.com", wait_until="domcontentloaded")
-
-    _p(f"浏览器已打开，请扫码登录抖音（{timeout} 秒内完成）。")
-    _p("登录成功后页面会自动跳转，脚本会自动检测并保存 Cookie。")
-
-    done = False
-    for i in range(timeout // 2):
-        time.sleep(2)
+    for i in range(timeout // 3):
+        time.sleep(3)
+        output = _run("agent-browser storage cookie get", timeout=5)
         try:
-            cookies = {c["name"]: c["value"] for c in _context.cookies()}
-            # 登录成功标志：有 sessionid 或 LOGIN_STATUS=1
-            has_session = "sessionid" in cookies or "sessionid_ss" in cookies
-            login_status = cookies.get("LOGIN_STATUS") == "1"
-            if has_session or login_status:
-                time.sleep(3)
-                done = True
-                _p("检测到登录成功，正在保存 Cookie...")
-                break
-        except Exception:
+            cookies = json.loads(output)
+            names = {c["name"] for c in cookies if isinstance(c, dict)}
+            if "sessionid" in names or "sessionid_ss" in names:
+                time.sleep(3)  # 多等一会让 session 完全建立
+                _p("检测到登录成功！")
+                _p("浏览器 profile 已保存，下次打开会自动恢复登录态。")
+                # 同时备份 cookie 到文件
+                pairs = {c["name"]: c["value"] for c in cookies if isinstance(c, dict)}
+                COOKIE_FILE.write_text("; ".join(f"{k}={v}" for k, v in pairs.items()))
+                _p(f"Cookie 备份: {COOKIE_FILE}")
+                _run("agent-browser close", timeout=5)
+                return
+        except (json.JSONDecodeError, TypeError):
             pass
         if i % 10 == 9:
-            _p(f"  仍在等待扫码... ({(i + 1) * 2}秒)")
+            _p(f"  等待中... ({(i+1)*3}秒)")
 
-    if not done:
-        _p("等待超时。关闭浏览器。")
-        _browser.close()
-        _playwright.stop()
-        _browser = _page = _context = _playwright = None
-        return
-
-    # 保存 cookie
-    cookie_pairs = {}
-    for c in _context.cookies():
-        cookie_pairs[c["name"]] = c["value"]
-    cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_pairs.items())
-
-    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_FILE.write_text(cookie_str)
-    _p(f"Cookie 已保存到 {COOKIE_FILE}")
-
-    _browser.close()
-    _browser = _page = _context = None
-    _playwright.stop()
-    _playwright = None
+    _p("等待超时")
+    _run("agent-browser close", timeout=5)
 
 
 def save_cookie_string(cookie_str: str) -> None:
@@ -531,31 +350,43 @@ def save_cookie_string(cookie_str: str) -> None:
     if not cookie_str:
         _p("Cookie 不能为空")
         return
-    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     COOKIE_FILE.write_text(cookie_str)
-    cookies = _parse_cookie_string(cookie_str)
-    names = {c["name"] for c in cookies}
+    cookies = [p.strip().split("=", 1) for p in cookie_str.split(";") if "=" in p]
     _p(f"Cookie 已保存（{len(cookies)} 项）")
-    if "ttwid" not in names:
-        _p("警告: 缺少 ttwid，可能无法正常使用")
+
+
+def _has_valid_cookie() -> bool:
+    # 优先检查浏览器 profile 是否存在
+    if BROWSER_DATA_DIR.exists() and any(BROWSER_DATA_DIR.iterdir()):
+        return True
+    if COOKIE_FILE.exists() and COOKIE_FILE.read_text().strip():
+        return True
+    return False
 
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "login":
         login_interactive()
     elif len(sys.argv) > 2 and sys.argv[1] == "set-cookie":
         save_cookie_string(sys.argv[2])
     elif len(sys.argv) > 1 and sys.argv[1] == "status":
-        if _has_valid_cookie():
-            cookies = _parse_cookie_string(COOKIE_FILE.read_text().strip())
-            names = {c["name"] for c in cookies}
-            logged_in = "sessionid" in names or "sessionid_ss" in names
-            print(f"{'已登录' if logged_in else '有 Cookie 但未登录'}（{len(cookies)} 个 cookie）")
+        if BROWSER_DATA_DIR.exists() and any(BROWSER_DATA_DIR.iterdir()):
+            print("已有浏览器 profile（登录态应已保存）")
+        elif _has_valid_cookie():
+            print("有 Cookie 文件")
         else:
             print("未登录")
+    elif len(sys.argv) > 1 and sys.argv[1] == "screenshot":
+        _ensure_browser()
+        out = sys.argv[2] if len(sys.argv) > 2 else "/tmp/douyin_screenshot.png"
+        _run(f"agent-browser screenshot --annotate {out}")
+        print(f"截图: {out}")
     else:
         print("用法:")
-        print("  python douyin_sign.py login              # 扫码登录")
+        print("  python douyin_sign.py login              # 登录（验证码+扫码）")
         print('  python douyin_sign.py set-cookie "..."    # 手动粘贴 Cookie')
         print("  python douyin_sign.py status             # 检查登录状态")
+        print("  python douyin_sign.py screenshot [path]  # 截图")
