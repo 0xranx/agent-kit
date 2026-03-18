@@ -8,6 +8,8 @@
 
 ### 1. 安装依赖
 
+需要 **Python >= 3.11**（推荐 `uv run --python 3.12`）。
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -72,8 +74,18 @@ python feishu_doc.py delete-block <URL> <block_id>
 
 ### 知识库
 ```bash
-python feishu_doc.py wiki-sync <file.md> --parent <node>  # 同步（幂等）
-python feishu_doc.py wiki-move <URL> <parent_node>        # 移入知识库
+python feishu_doc.py wiki-spaces                                   # 列出可访问的知识库
+python feishu_doc.py wiki-sync <file.md> --parent <node>           # 同步（幂等）
+python feishu_doc.py wiki-move <URL> <parent_node>                 # 移入知识库
+python feishu_doc.py wiki-move <URL> <parent_node> --title "标题"  # 移入并设标题
+```
+
+### 权限管理
+```bash
+python feishu_doc.py permission <URL> editable   # 组织内可编辑
+python feishu_doc.py permission <URL> viewable   # 组织内可查看
+python feishu_doc.py permission <URL> public     # 互联网可查看
+python feishu_doc.py permission <URL> closed     # 关闭链接分享
 ```
 
 ### 群消息
@@ -86,7 +98,7 @@ python feishu_doc.py read-chat 10
 ### 管理
 ```bash
 python feishu_doc.py test     # 测试连通性
-python feishu_doc.py login    # OAuth 登录（知识库写入需要）
+python feishu_doc.py login    # OAuth 登录（可选，wiki-move 的 fallback）
 ```
 
 ## 作为 AI Skill 使用
@@ -107,6 +119,6 @@ python feishu_doc.py login    # OAuth 登录（知识库写入需要）
 
 - 知识库写入需要 Bot 被添加为空间「可编辑」成员
 - 公开知识库无法通过 API 添加 Bot，需人工操作
-- `wiki-move` 需要 OAuth user_access_token
+- `wiki-move` 优先使用 tenant token，失败时 fallback 到 OAuth
 - 表格超过 9 行会自动拆分（飞书 API 限制）
 - `read` 命令依赖 `feishu-docx` 的全局凭证配置

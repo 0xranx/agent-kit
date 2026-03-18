@@ -13,10 +13,14 @@
     python feishu_doc.py overwrite <URL> -f file             # 清空重写
     python feishu_doc.py update-block <URL> <block_id> "txt" # 更新单块
     python feishu_doc.py delete-block <URL> <block_id>       # 删除单块
+    python feishu_doc.py wiki-spaces                          # 列出知识库
     python feishu_doc.py wiki-tree <space_id|URL>            # 知识库树
     python feishu_doc.py wiki-move <URL> <parent_node>       # 移入知识库
+    python feishu_doc.py wiki-move <URL> <parent> --title X  # 移入并设标题
     python feishu_doc.py wiki-sync <md_path> --parent <node> # 同步到知识库
     python feishu_doc.py export-wiki <space_id|URL> -o dir   # 批量导出
+    python feishu_doc.py permission <URL> editable           # 组织内可编辑
+    python feishu_doc.py permission <URL> viewable           # 组织内可查看
     python feishu_doc.py import-wechat <URL>                 # 微信文章→飞书
     python feishu_doc.py notify "标题" "内容"                 # 群卡片消息
     python feishu_doc.py send "文本"                          # 群文本消息
@@ -113,7 +117,7 @@ async def _get_tenant_token(client: httpx.AsyncClient) -> str:
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != 0:
-        raise RuntimeError(f"获取 token 失败: {data}")
+        raise RuntimeError(f"获取 token 失败: code={data.get('code')}, msg={data.get('msg')}")
     _token_cache["token"] = data["tenant_access_token"]
     _token_cache["expires_at"] = now + 5400
     return _token_cache["token"]
@@ -136,6 +140,7 @@ def _load_user_token() -> dict | None:
 
 def _save_user_token(data: dict) -> None:
     USER_TOKEN_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    USER_TOKEN_PATH.chmod(0o600)
 
 
 async def _get_user_token(client: httpx.AsyncClient) -> str:
@@ -157,7 +162,7 @@ async def _get_user_token(client: httpx.AsyncClient) -> str:
         json={"grant_type": "refresh_token", "refresh_token": refresh})
     data = resp.json()
     if data.get("code") != 0:
-        raise RuntimeError(f"刷新 token 失败: {data}")
+        raise RuntimeError(f"刷新 token 失败: code={data.get('code')}, msg={data.get('msg')}")
     new = data["data"]
     info = {
         "access_token": new["access_token"],
@@ -222,6 +227,14 @@ async def _get_doc_id(client: httpx.AsyncClient, url: str) -> str:
     return token
 
 
+def _subprocess_env() -> dict[str, str]:
+    """构建 subprocess 环境变量，通过 env 传递凭证而非命令行参数。"""
+    env = os.environ.copy()
+    env["FEISHU_APP_ID"] = CFG["app_id"]
+    env["FEISHU_APP_SECRET"] = CFG["app_secret"]
+    return env
+
+
 # ── 读取 ─────────────────────────────────────────
 
 async def cmd_read(url: str, with_block_ids: bool = False) -> None:
@@ -231,11 +244,10 @@ async def cmd_read(url: str, with_block_ids: bool = False) -> None:
     if export_dir.exists():
         shutil.rmtree(export_dir)
 
-    args = ["feishu-docx", "export", url, "-o", str(export_dir),
-            "--app-id", CFG["app_id"], "--app-secret", CFG["app_secret"]]
+    args = ["feishu-docx", "export", url, "-o", str(export_dir)]
     if with_block_ids:
         args.append("--with-block-ids")
-    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60, env=_subprocess_env())
     if result.returncode != 0:
         print(f"导出失败: {result.stderr[-300:]}")
         return
@@ -392,14 +404,14 @@ def _md_to_blocks(md_content: str) -> list[dict]:
     return MarkdownConverter().convert(md_content)
 
 
-async def cmd_create(title: str, content: str | None, file: str | None, wiki_parent: str | None) -> None:
-    """创建飞书文档。"""
+async def cmd_create(title: str, content: str | None, file: str | None, wiki_parent: str | None) -> str | None:
+    """创建飞书文档。返回创建的文档 URL，失败返回 None。"""
     md = content or ""
     if file:
         md = Path(file).read_text(encoding="utf-8")
     if not md and not title:
         print("请提供内容（-c 或 -f）")
-        return
+        return None
 
     blocks = _md_to_blocks(md) if md else []
     mode = CFG["mode"]
@@ -410,6 +422,14 @@ async def cmd_create(title: str, content: str | None, file: str | None, wiki_par
         headers = await _headers(client)
 
         # 尝试 wiki 模式
+        if (mode in ("wiki", "auto")) and wiki_parent and not space_id:
+            print("提示: wiki_space_id 未配置，无法直接写入知识库。")
+            print("  请设置环境变量 FEISHU_WIKI_SPACE_ID 或编辑 config.yaml")
+            print("  可执行 wiki-spaces 命令查看可用的知识库 space_id")
+            if mode == "wiki":
+                return None
+            print("  降级为云文档模式...")
+
         if (mode in ("wiki", "auto")) and wiki_parent and space_id:
             resp = await client.post(f"{BASE}/wiki/v2/spaces/{space_id}/nodes", headers=headers, json={
                 "obj_type": "docx", "node_type": "origin",
@@ -424,10 +444,10 @@ async def cmd_create(title: str, content: str | None, file: str | None, wiki_par
                     print(f"写入内容 ({len(blocks)} 个块)...")
                     await _write_blocks(client, doc_id, blocks)
                 print(f"已创建: {url}")
-                return
+                return url
             elif mode == "wiki":
                 print(f"知识库写入失败: {data.get('msg')}")
-                return
+                return None
             else:
                 print(f"知识库权限不足，降级为云文档模式")
 
@@ -436,7 +456,7 @@ async def cmd_create(title: str, content: str | None, file: str | None, wiki_par
         data = resp.json()
         if data.get("code") != 0:
             print(f"创建失败: {data.get('msg')}")
-            return
+            return None
         doc_id = data["data"]["document"]["document_id"]
         url = f"https://feishu.cn/docx/{doc_id}"
         if blocks:
@@ -445,6 +465,7 @@ async def cmd_create(title: str, content: str | None, file: str | None, wiki_par
         print(f"已创建: {url}")
         if wiki_parent:
             print(f"提示: 如需移入知识库，执行 wiki-move {url} {wiki_parent}")
+        return url
 
 
 async def cmd_append(url: str, content: str | None, file: str | None) -> None:
@@ -534,6 +555,47 @@ async def cmd_delete_block(url: str, block_id: str) -> None:
 
 # ── 知识库 ───────────────────────────────────────
 
+async def cmd_wiki_spaces() -> None:
+    """列出 Bot 可访问的所有知识库，帮助发现 space_id。"""
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = await _headers(client)
+        page_token = None
+        spaces = []
+        while True:
+            params = {"page_size": 50}
+            if page_token:
+                params["page_token"] = page_token
+            resp = await client.get(f"{BASE}/wiki/v2/spaces", headers=headers, params=params)
+            data = resp.json()
+            if data.get("code") != 0:
+                print(f"获取知识库列表失败: {data.get('msg')}")
+                print("请确认 Bot 已被添加到至少一个知识库")
+                return
+            items = data.get("data", {}).get("items", [])
+            spaces.extend(items)
+            has_more = data.get("data", {}).get("has_more", False)
+            page_token = data.get("data", {}).get("page_token")
+            if not has_more or not page_token:
+                break
+
+        if not spaces:
+            print("未找到知识库（Bot 可能未被添加到任何知识库）")
+            return
+
+        current = CFG.get("wiki_space_id", "")
+        print(f"找到 {len(spaces)} 个知识库:\n")
+        for s in spaces:
+            sid = s.get("space_id", "")
+            marker = " ← 当前配置" if sid == current else ""
+            print(f"  {s.get('name', '(无名称)')} | space_id={sid} | {s.get('visibility', '')}{marker}")
+
+        if not current:
+            if len(spaces) == 1:
+                print(f"\n只有一个知识库，建议配置: FEISHU_WIKI_SPACE_ID={spaces[0]['space_id']}")
+            else:
+                print(f"\n请选择一个 space_id 配置到 FEISHU_WIKI_SPACE_ID 环境变量或 config.yaml")
+
+
 async def cmd_wiki_tree(target: str) -> None:
     """显示知识库树形结构。"""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -554,43 +616,122 @@ async def cmd_wiki_tree(target: str) -> None:
             print(f"知识库: space_id={space_id}\n")
 
         async def print_tree(parent_token, indent=0):
-            params = {"page_size": 50}
-            if parent_token:
-                params["parent_node_token"] = parent_token
-            r = await client.get(f"{BASE}/wiki/v2/spaces/{space_id}/nodes",
-                                 headers=headers, params=params)
-            nodes = r.json().get("data", {}).get("items", [])
-            for n in nodes:
-                prefix = "  " * indent + ("+" if n.get("has_child") else "-")
-                print(f"{prefix} {n.get('title')} [{n.get('obj_type')}]")
-                if n.get("has_child"):
-                    await print_tree(n["node_token"], indent + 1)
+            page_token = None
+            while True:
+                params = {"page_size": 50}
+                if parent_token:
+                    params["parent_node_token"] = parent_token
+                if page_token:
+                    params["page_token"] = page_token
+                r = await client.get(f"{BASE}/wiki/v2/spaces/{space_id}/nodes",
+                                     headers=headers, params=params)
+                data = r.json().get("data", {})
+                nodes = data.get("items", [])
+                for n in nodes:
+                    prefix = "  " * indent + ("+" if n.get("has_child") else "-")
+                    print(f"{prefix} {n.get('title')} [{n.get('obj_type')}]")
+                    if n.get("has_child"):
+                        await print_tree(n["node_token"], indent + 1)
+                if not data.get("has_more") or not data.get("page_token"):
+                    break
+                page_token = data["page_token"]
 
         await print_tree(root_token)
 
 
-async def cmd_wiki_move(doc_url: str, parent_node: str) -> None:
-    """将云文档移入知识库（需 OAuth user token）。"""
+async def cmd_wiki_move(doc_url: str, parent_node: str, title: str | None = None) -> str | None:
+    """将云文档移入知识库。优先使用 tenant token，失败后尝试 OAuth user token。"""
     async with httpx.AsyncClient(timeout=30) as client:
-        user_token = await _get_user_token(client)
-        headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
-
         _, doc_token = _parse_url(doc_url)
         space_id = CFG.get("wiki_space_id", "")
         if not space_id:
-            print("请在 config.yaml 中配置 wiki_space_id")
+            print("请配置 wiki_space_id（设置环境变量 FEISHU_WIKI_SPACE_ID 或编辑 config.yaml）")
+            print("  可执行 wiki-spaces 命令查看可用的知识库 space_id")
             return
 
-        resp = await client.post(f"{BASE}/wiki/v2/spaces/{space_id}/nodes", headers=headers, json={
+        move_body = {
             "obj_type": "docx", "obj_token": doc_token,
             "parent_node_token": parent_node, "node_type": "origin",
-        })
+        }
+
+        # 优先用 tenant token
+        headers = await _headers(client)
+        resp = await client.post(f"{BASE}/wiki/v2/spaces/{space_id}/nodes", headers=headers, json=move_body)
         data = resp.json()
+
+        if data.get("code") != 0:
+            # tenant token 失败，尝试 user token
+            print(f"Tenant token 移入失败 (code={data.get('code')}), 尝试 OAuth...")
+            try:
+                user_token = await _get_user_token(client)
+                headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
+                resp = await client.post(f"{BASE}/wiki/v2/spaces/{space_id}/nodes", headers=headers, json=move_body)
+                data = resp.json()
+            except RuntimeError as e:
+                print(f"OAuth 不可用: {e}")
+                print(f"原始错误: {data.get('msg')}")
+                return
+
         if data.get("code") == 0:
             node = data["data"]["node"]
-            print(f"已移入知识库: https://feishu.cn/wiki/{node['node_token']}")
+            node_token = node["node_token"]
+            wiki_url = f"https://feishu.cn/wiki/{node_token}"
+            print(f"已移入知识库: {wiki_url}")
+            # 自动更新标题
+            if title:
+                title_resp = await client.post(
+                    f"{BASE}/wiki/v2/spaces/{space_id}/nodes/{node_token}/update_title",
+                    headers=headers, json={"title": title})
+                if title_resp.json().get("code") == 0:
+                    print(f"已更新标题: {title}")
+                else:
+                    print(f"标题更新失败: {title_resp.json().get('msg')}（可手动修改）")
+            return wiki_url
         else:
             print(f"移入失败: {data.get('msg')}")
+            return None
+
+
+async def cmd_permission(doc_url: str, level: str) -> None:
+    """设置文档链接分享权限。level: editable/viewable/closed"""
+    level_map = {
+        "editable": "tenant_editable",
+        "viewable": "tenant_readable",
+        "public": "anyone_readable",
+        "closed": "closed",
+    }
+    link_share = level_map.get(level)
+    if not link_share:
+        print(f"不支持的权限级别: {level}")
+        print(f"  可选: {', '.join(level_map.keys())}")
+        return
+
+    if level == "public":
+        print("警告: 文档将对互联网所有人可见（非仅组织内）")
+
+    doc_type, doc_token = _parse_url(doc_url)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = await _headers(client)
+
+        # wiki URL 需要先解析为 obj_token
+        if doc_type == "wiki":
+            try:
+                doc_token = await _resolve_wiki_obj_token(client, doc_token)
+            except RuntimeError as e:
+                print(f"Wiki 节点解析失败: {e}")
+                return
+            doc_type = "docx"
+
+        resp = await client.patch(
+            f"{BASE}/drive/v2/permissions/{doc_token}/public",
+            headers=headers, params={"type": doc_type},
+            json={"link_share_entity": link_share})
+        data = resp.json()
+        if data.get("code") == 0:
+            print(f"权限已设置: {level} ({link_share})")
+        else:
+            print(f"权限设置失败: {data.get('msg')}")
 
 
 async def cmd_wiki_sync(md_path: str, parent_node: str | None) -> None:
@@ -637,26 +778,30 @@ async def cmd_wiki_sync(md_path: str, parent_node: str | None) -> None:
                     return
 
         # 创建
-        await cmd_create(title, text, None, parent)
+        url = await cmd_create(title, text, None, parent)
 
-        # TODO: 记录到 registry（create 成功后的 URL 需要传递出来）
-        print(f"同步完成")
+        # 记录到 registry（重新读取以减少并发覆盖风险）
+        if url:
+            registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8")) if REGISTRY_PATH.exists() else {}
+            registry[key] = {"title": title, "url": url, "synced_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            REGISTRY_PATH.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(f"同步完成，已记录到 registry")
+        else:
+            print(f"同步失败")
 
 
 async def cmd_export_wiki(target: str, output: str, max_depth: int = 3) -> None:
     """批量导出知识库。"""
-    args = ["feishu-docx", "export-wiki-space", target, "-o", output, "--max-depth", str(max_depth),
-            "--app-id", CFG["app_id"], "--app-secret", CFG["app_secret"]]
-    result = subprocess.run(args, capture_output=False, timeout=300)
+    args = ["feishu-docx", "export-wiki-space", target, "-o", output, "--max-depth", str(max_depth)]
+    result = subprocess.run(args, capture_output=False, timeout=300, env=_subprocess_env())
     if result.returncode != 0:
         print("导出失败")
 
 
 async def cmd_import_wechat(url: str) -> None:
     """微信文章→飞书文档。"""
-    args = ["feishu-docx", "create", "--url", url,
-            "--app-id", CFG["app_id"], "--app-secret", CFG["app_secret"]]
-    result = subprocess.run(args, capture_output=False, timeout=60)
+    args = ["feishu-docx", "create", "--url", url]
+    result = subprocess.run(args, capture_output=False, timeout=60, env=_subprocess_env())
 
 
 # ── 群消息 ───────────────────────────────────────
@@ -821,13 +966,13 @@ def cmd_login() -> None:
 
 async def cmd_test() -> None:
     """测试 API 连通性。"""
-    print(f"App ID: {CFG['app_id'][:12]}...")
+    print(f"App ID: {CFG['app_id'][:6]}****")
     print(f"Mode:   {CFG['mode']}\n")
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             token = await _get_tenant_token(client)
-            print(f"Token:  {token[:15]}...")
+            print(f"Token:  {token[:6]}****")
         except Exception as e:
             print(f"Token 获取失败: {e}")
             return
@@ -892,57 +1037,70 @@ def main():
     def has_flag(name: str) -> bool:
         return name in args
 
+    def run(coro):
+        try:
+            return asyncio.run(coro)
+        except RuntimeError as e:
+            print(f"错误: {e}")
+            sys.exit(1)
+
     if cmd == "read" and len(args) >= 2:
-        asyncio.run(cmd_read(args[1], with_block_ids=has_flag("--with-block-ids")))
+        run(cmd_read(args[1], with_block_ids=has_flag("--with-block-ids")))
 
     elif cmd == "list-blocks" and len(args) >= 2:
-        asyncio.run(cmd_list_blocks(args[1]))
+        run(cmd_list_blocks(args[1]))
 
     elif cmd == "create" and len(args) >= 2:
-        asyncio.run(cmd_create(args[1], get_flag("-c"), get_flag("-f"), get_flag("--wiki")))
+        run(cmd_create(args[1], get_flag("-c"), get_flag("-f"), get_flag("--wiki")))
 
     elif cmd == "append" and len(args) >= 2:
-        asyncio.run(cmd_append(args[1], get_flag("-c"), get_flag("-f")))
+        run(cmd_append(args[1], get_flag("-c"), get_flag("-f")))
 
     elif cmd == "overwrite" and len(args) >= 2:
-        asyncio.run(cmd_overwrite(args[1], get_flag("-c"), get_flag("-f")))
+        run(cmd_overwrite(args[1], get_flag("-c"), get_flag("-f")))
 
     elif cmd == "update-block" and len(args) >= 4:
-        asyncio.run(cmd_update_block(args[1], args[2], " ".join(args[3:])))
+        run(cmd_update_block(args[1], args[2], " ".join(args[3:])))
 
     elif cmd == "delete-block" and len(args) >= 3:
-        asyncio.run(cmd_delete_block(args[1], args[2]))
+        run(cmd_delete_block(args[1], args[2]))
+
+    elif cmd == "wiki-spaces":
+        run(cmd_wiki_spaces())
 
     elif cmd == "wiki-tree" and len(args) >= 2:
-        asyncio.run(cmd_wiki_tree(args[1]))
+        run(cmd_wiki_tree(args[1]))
 
     elif cmd == "wiki-move" and len(args) >= 3:
-        asyncio.run(cmd_wiki_move(args[1], args[2]))
+        run(cmd_wiki_move(args[1], args[2], get_flag("--title")))
 
     elif cmd == "wiki-sync" and len(args) >= 2:
-        asyncio.run(cmd_wiki_sync(args[1], get_flag("--parent")))
+        run(cmd_wiki_sync(args[1], get_flag("--parent")))
+
+    elif cmd == "permission" and len(args) >= 3:
+        run(cmd_permission(args[1], args[2]))
 
     elif cmd == "export-wiki" and len(args) >= 2:
-        asyncio.run(cmd_export_wiki(args[1], get_flag("-o") or "./wiki_export", int(get_flag("--max-depth") or "3")))
+        run(cmd_export_wiki(args[1], get_flag("-o") or "./wiki_export", int(get_flag("--max-depth") or "3")))
 
     elif cmd == "import-wechat" and len(args) >= 2:
-        asyncio.run(cmd_import_wechat(args[1]))
+        run(cmd_import_wechat(args[1]))
 
     elif cmd == "notify" and len(args) >= 3:
-        asyncio.run(cmd_notify(args[1], " ".join(args[2:])))
+        run(cmd_notify(args[1], " ".join(args[2:])))
 
     elif cmd == "send" and len(args) >= 2:
-        asyncio.run(cmd_send(" ".join(args[1:])))
+        run(cmd_send(" ".join(args[1:])))
 
     elif cmd == "read-chat":
         count = int(args[1]) if len(args) >= 2 else 10
-        asyncio.run(cmd_read_chat(count))
+        run(cmd_read_chat(count))
 
     elif cmd == "login":
         cmd_login()
 
     elif cmd == "test":
-        asyncio.run(cmd_test())
+        run(cmd_test())
 
     else:
         print(__doc__)
