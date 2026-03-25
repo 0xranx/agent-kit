@@ -201,7 +201,8 @@ def search_users(keyword: str) -> dict:
         (() => {
             const el = document.getElementById("RENDER_DATA");
             if (!el) return JSON.stringify({data: []});
-            const data = JSON.parse(decodeURIComponent(el.textContent));
+            let data = JSON.parse(decodeURIComponent(el.textContent));
+            if (data.app && Object.keys(data).length === 1) data = data.app;
             for (const [k, v] of Object.entries(data)) {
                 if (v && v.user_list) return JSON.stringify({data: v.user_list});
             }
@@ -228,10 +229,18 @@ def get_video_detail(aweme_id: str) -> dict:
         (() => {
             const el = document.getElementById("RENDER_DATA");
             if (!el) return JSON.stringify({error: "no RENDER_DATA"});
-            const data = JSON.parse(decodeURIComponent(el.textContent));
+            let data = JSON.parse(decodeURIComponent(el.textContent));
+            if (data.app && Object.keys(data).length === 1) data = data.app;
+            // 新结构：data.videoDetail 或遍历找 aweme.detail
+            if (data.videoDetail && data.videoDetail.awemeDetail) {
+                return JSON.stringify({aweme_detail: data.videoDetail.awemeDetail});
+            }
             for (const [k, v] of Object.entries(data)) {
                 if (v && v.aweme && v.aweme.detail) {
                     return JSON.stringify({aweme_detail: v.aweme.detail});
+                }
+                if (v && v.awemeDetail) {
+                    return JSON.stringify({aweme_detail: v.awemeDetail});
                 }
             }
             return JSON.stringify({error: "no detail"});
@@ -301,7 +310,12 @@ def get_user_profile(sec_user_id: str) -> dict:
         (() => {
             const el = document.getElementById("RENDER_DATA");
             if (!el) return JSON.stringify({error: "no"});
-            const data = JSON.parse(decodeURIComponent(el.textContent));
+            let data = JSON.parse(decodeURIComponent(el.textContent));
+            if (data.app && Object.keys(data).length === 1) data = data.app;
+            // 新结构：data.user.info 包含用户信息
+            if (data.user && data.user.info && data.user.info.nickname) {
+                return JSON.stringify({user: data.user.info});
+            }
             for (const [k, v] of Object.entries(data)) {
                 if (v && v.user && v.user.user) return JSON.stringify({user: v.user.user});
                 if (v && v.user && v.user.secUid) return JSON.stringify({user: v.user});
@@ -327,7 +341,8 @@ def get_user_posts(sec_user_id: str) -> dict:
         (() => {
             const el = document.getElementById("RENDER_DATA");
             if (!el) return JSON.stringify({error: "no"});
-            const data = JSON.parse(decodeURIComponent(el.textContent));
+            let data = JSON.parse(decodeURIComponent(el.textContent));
+            if (data.app && Object.keys(data).length === 1) data = data.app;
             for (const [k, v] of Object.entries(data)) {
                 if (v && v.post && v.post.data) {
                     return JSON.stringify({aweme_list: v.post.data, has_more: v.post.hasMore || 0});
