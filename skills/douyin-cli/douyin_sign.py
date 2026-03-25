@@ -22,6 +22,7 @@ BROWSER_DATA_DIR = DATA_DIR / "browser_profile"  # 持久化浏览器数据
 COOKIE_FILE = DATA_DIR / "douyin_cookie.txt"      # 备用 cookie 文件
 
 _browser_open = False
+_use_auto_connect = False  # True = 连接用户已打开的 Chrome
 
 
 def _p(msg: str):
@@ -40,11 +41,35 @@ def _run(cmd: str, timeout: int = 15) -> str:
 
 # ── 浏览器管理 ───────────────────────────────────
 
+def set_auto_connect(enabled: bool = True):
+    """切换到 auto-connect 模式（连接用户已登录的 Chrome，绕过验证码）。"""
+    global _use_auto_connect
+    _use_auto_connect = enabled
+
+
+def _ab_prefix() -> str:
+    """返回 agent-browser 命令前缀（根据模式选择 --auto-connect 或 --headed --profile）。"""
+    if _use_auto_connect:
+        return "agent-browser --auto-connect"
+    return "agent-browser"
+
+
 def _ensure_browser():
     """确保浏览器已打开。使用持久化 profile 复用登录态。"""
     global _browser_open
     if _browser_open:
         return
+
+    if _use_auto_connect:
+        # auto-connect 模式：直接连接用户的 Chrome，不需要启动
+        url = _run(f"{_ab_prefix()} get url", timeout=10)
+        if url:
+            _browser_open = True
+            return
+        raise RuntimeError(
+            "无法连接到 Chrome。请确保 Chrome 已打开。\n"
+            "如果不使用 auto-connect 模式，请先运行: python douyin.py login"
+        )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     profile_dir = DATA_DIR / "profile"
@@ -61,7 +86,8 @@ def _ensure_browser():
 
 def _close_browser():
     global _browser_open
-    _run("agent-browser close")
+    if not _use_auto_connect:
+        _run("agent-browser close")
     _browser_open = False
 
 
@@ -70,9 +96,8 @@ def _wait_for_content(selector: str, label: str = "内容", max_wait: int = 300)
     _p(f"等待{label}加载（如有验证码或登录弹窗，请在浏览器中完成）...")
     for i in range(max_wait // 2):
         time.sleep(2)
-        # 用 eval JS 检测元素数量
         count = _run(
-            f"agent-browser eval \"document.querySelectorAll('{selector}').length\"",
+            f"{_ab_prefix()} eval \"document.querySelectorAll('{selector}').length\"",
             timeout=5
         )
         try:
@@ -90,7 +115,7 @@ def _wait_for_content(selector: str, label: str = "内容", max_wait: int = 300)
 def _navigate(url: str, timeout: int = 30):
     """导航到 URL。"""
     _ensure_browser()
-    _run(f'agent-browser goto "{url}"', timeout=timeout)
+    _run(f'{_ab_prefix()} open "{url}"', timeout=timeout)
     time.sleep(3)
 
 
@@ -98,7 +123,7 @@ def _eval_js(script: str, timeout: int = 15):
     """在页面中执行 JavaScript 并返回结果。"""
     try:
         result = subprocess.run(
-            ["agent-browser", "eval", "--stdin"],
+            _ab_prefix().split() + ["eval", "--stdin"],
             input=script, capture_output=True, text=True, timeout=timeout
         )
         raw = result.stdout.strip()
@@ -215,14 +240,14 @@ def get_video_detail(aweme_id: str) -> dict:
 
 def get_comments(aweme_id: str) -> dict:
     """获取视频评论。"""
-    current_url = _run("agent-browser get url", timeout=5)
+    current_url = _run(f"{_ab_prefix()} get url", timeout=5)
     if aweme_id not in (current_url or ""):
         _navigate(f"https://www.douyin.com/video/{aweme_id}")
         _wait_for_content('#RENDER_DATA', "视频页面")
         time.sleep(3)
 
     # 滚动触发评论加载
-    _run('agent-browser scroll --direction down --amount 500')
+    _run(f'{_ab_prefix()} scroll down 500')
     time.sleep(3)
 
     result = _eval_js('''
@@ -285,7 +310,7 @@ def get_user_profile(sec_user_id: str) -> dict:
 
 def get_user_posts(sec_user_id: str) -> dict:
     """获取用户作品列表。"""
-    current_url = _run("agent-browser get url", timeout=5)
+    current_url = _run(f"{_ab_prefix()} get url", timeout=5)
     if sec_user_id not in (current_url or ""):
         _navigate(f"https://www.douyin.com/user/{sec_user_id}")
         _wait_for_content('#RENDER_DATA', "用户主页")
@@ -308,6 +333,17 @@ def get_user_posts(sec_user_id: str) -> dict:
     if isinstance(result, dict) and result.get("aweme_list"):
         return result
     return {"aweme_list": [], "msg": "获取用户作品失败"}
+
+
+# ── 翻页加载 ──────────────────────────────────────
+
+def scroll_more(count: int = 3) -> str:
+    """在当前页面滚动加载更多内容。"""
+    _ensure_browser()
+    for i in range(count):
+        _run(f'{_ab_prefix()} scroll down 1000')
+        time.sleep(2)
+    return _run(f'{_ab_prefix()} get url', timeout=5)
 
 
 # ── 登录 ─────────────────────────────────────────
