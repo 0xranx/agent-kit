@@ -28,6 +28,8 @@ from douyin_sign import (
     get_user_posts,
     login_interactive,
     save_cookie_string,
+    scroll_more,
+    set_auto_connect,
     _has_valid_cookie,
     COOKIE_FILE,
     BROWSER_DATA_DIR,
@@ -236,14 +238,33 @@ HELP = """用法:
   python douyin.py video <aweme_id>               详情 + 评论
   python douyin.py user <sec_user_id>             用户主页
   python douyin.py posts <sec_user_id>            用户作品
+  python douyin.py more [次数]                    滚动加载更多（默认3次）
+  python douyin.py export <文件路径> [--csv]       导出上次搜索结果
   python douyin.py login                          扫码登录
   python douyin.py set-cookie "..."               手动粘贴 Cookie
   python douyin.py status                         检查登录状态
+
+选项:
+  --auto-connect    连接用户已登录的 Chrome（绕过验证码，推荐）
 """
 
 
+_last_search_result = None  # 缓存上次搜索结果供 export 使用
+
+
 def main():
+    global _last_search_result
+
     args = sys.argv[1:]
+    if not args:
+        print(HELP)
+        return
+
+    # 全局选项：--auto-connect
+    if "--auto-connect" in args:
+        set_auto_connect(True)
+        args = [a for a in args if a != "--auto-connect"]
+
     if not args:
         print(HELP)
         return
@@ -253,9 +274,13 @@ def main():
     if cmd == "search" and len(args) >= 2:
         keyword = args[1]
         if "--user" in args:
-            print(fmt_search_users(search_users(keyword)))
+            data = search_users(keyword)
+            _last_search_result = data
+            print(fmt_search_users(data))
         else:
-            print(fmt_search(search_videos(keyword)))
+            data = search_videos(keyword)
+            _last_search_result = data
+            print(fmt_search(data))
 
     elif cmd == "detail" and len(args) >= 2:
         print(fmt_detail(get_video_detail(args[1])))
@@ -274,7 +299,23 @@ def main():
         print(fmt_user(get_user_profile(args[1])))
 
     elif cmd == "posts" and len(args) >= 2:
-        print(fmt_posts(get_user_posts(args[1])))
+        data = get_user_posts(args[1])
+        _last_search_result = data
+        print(fmt_posts(data))
+
+    elif cmd == "more":
+        n = int(args[1]) if len(args) > 1 else 3
+        print(f"正在滚动加载更多（{n} 次）...")
+        scroll_more(n)
+        print("加载完成。重新执行 search/posts 命令可获取更多结果。")
+
+    elif cmd == "export" and len(args) >= 2:
+        filepath = args[1]
+        fmt = "csv" if "--csv" in args else "json"
+        if not _last_search_result:
+            print("没有可导出的数据。请先执行 search 或 posts 命令。")
+            return
+        _export_data(_last_search_result, filepath, fmt)
 
     elif cmd == "login":
         login_interactive()
@@ -292,6 +333,55 @@ def main():
 
     else:
         print(HELP)
+
+
+def _export_data(data: dict, filepath: str, fmt: str = "json"):
+    """导出搜索/作品结果到文件。"""
+    import csv
+    import os
+
+    # 提取列表数据
+    items = data.get("aweme_list") or data.get("data", [])
+    if not items:
+        print("数据为空，无法导出。")
+        return
+
+    # 标准化为扁平结构
+    rows = []
+    for item in items:
+        aweme = item
+        if item.get("aweme_info"):
+            aweme = item["aweme_info"]
+        author = aweme.get("author", {})
+        stats = aweme.get("statistics", {})
+        rows.append({
+            "aweme_id": aweme.get("aweme_id", ""),
+            "desc": (aweme.get("desc") or "")[:200],
+            "author": author.get("nickname", ""),
+            "sec_uid": author.get("sec_uid", ""),
+            "likes": stats.get("digg_count", 0),
+            "comments": stats.get("comment_count", 0),
+            "shares": stats.get("share_count", 0),
+            "create_time": aweme.get("create_time", ""),
+        })
+
+    if not rows:
+        print("无法解析数据结构。")
+        return
+
+    if not os.path.isabs(filepath):
+        filepath = os.path.join(os.getcwd(), filepath)
+
+    if fmt == "csv":
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    print(f"已导出 {len(rows)} 条数据到 {filepath}")
 
 
 if __name__ == "__main__":
