@@ -15,9 +15,12 @@
   python douyin.py status                         # 检查登录状态
 """
 
+import csv
+import os
 import sys
 import json
 import datetime
+from pathlib import Path
 
 from douyin_sign import (
     search_videos,
@@ -33,7 +36,11 @@ from douyin_sign import (
     _has_valid_cookie,
     COOKIE_FILE,
     BROWSER_DATA_DIR,
+    DATA_DIR,
 )
+
+# 持久化结果文件（跨进程共享）
+_RESULT_CACHE = DATA_DIR / "last_result.json"
 
 
 def _ts_to_str(ts) -> str:
@@ -249,12 +256,23 @@ HELP = """用法:
 """
 
 
-_last_search_result = None  # 缓存上次搜索结果供 export 使用
+def _save_result(data: dict) -> None:
+    """持久化搜索/作品结果到磁盘，供 export 跨进程读取。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _RESULT_CACHE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_result():
+    """从磁盘读取上次搜索结果。"""
+    if _RESULT_CACHE.exists():
+        try:
+            return json.loads(_RESULT_CACHE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
 
 
 def main():
-    global _last_search_result
-
     args = sys.argv[1:]
     if not args:
         print(HELP)
@@ -275,11 +293,11 @@ def main():
         keyword = args[1]
         if "--user" in args:
             data = search_users(keyword)
-            _last_search_result = data
+            _save_result(data)
             print(fmt_search_users(data))
         else:
             data = search_videos(keyword)
-            _last_search_result = data
+            _save_result(data)
             print(fmt_search(data))
 
     elif cmd == "detail" and len(args) >= 2:
@@ -300,7 +318,7 @@ def main():
 
     elif cmd == "posts" and len(args) >= 2:
         data = get_user_posts(args[1])
-        _last_search_result = data
+        _save_result(data)
         print(fmt_posts(data))
 
     elif cmd == "more":
@@ -312,10 +330,11 @@ def main():
     elif cmd == "export" and len(args) >= 2:
         filepath = args[1]
         fmt = "csv" if "--csv" in args else "json"
-        if not _last_search_result:
+        data = _load_result()
+        if not data:
             print("没有可导出的数据。请先执行 search 或 posts 命令。")
             return
-        _export_data(_last_search_result, filepath, fmt)
+        _export_data(data, filepath, fmt)
 
     elif cmd == "login":
         login_interactive()
@@ -335,11 +354,15 @@ def main():
         print(HELP)
 
 
+def _sanitize_csv(value: str) -> str:
+    """防止 CSV 注入——Excel 会执行以 =+- @ 开头的公式。"""
+    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def _export_data(data: dict, filepath: str, fmt: str = "json"):
     """导出搜索/作品结果到文件。"""
-    import csv
-    import os
-
     # 提取列表数据
     items = data.get("aweme_list") or data.get("data", [])
     if not items:
@@ -376,7 +399,8 @@ def _export_data(data: dict, filepath: str, fmt: str = "json"):
         with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=rows[0].keys())
             writer.writeheader()
-            writer.writerows(rows)
+            for row in rows:
+                writer.writerow({k: _sanitize_csv(str(v)) for k, v in row.items()})
     else:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
