@@ -61,9 +61,16 @@ def _ensure_browser():
         return
 
     if _use_auto_connect:
-        # auto-connect 模式：直接连接用户的 Chrome，不需要启动
+        # auto-connect 模式：连接用户的 Chrome
+        # 先尝试直接获取 URL（session 可能还活着）
         url = _run(f"{_ab_prefix()} get url", timeout=10)
-        if url:
+        if url and not url.startswith("error:"):
+            _browser_open = True
+            return
+        # session 失效或首次连接，用 connect 重新建立
+        _run(f"{_ab_prefix()} connect 9222", timeout=10)
+        url = _run(f"{_ab_prefix()} get url", timeout=10)
+        if url and not url.startswith("error:"):
             _browser_open = True
             return
         raise RuntimeError(
